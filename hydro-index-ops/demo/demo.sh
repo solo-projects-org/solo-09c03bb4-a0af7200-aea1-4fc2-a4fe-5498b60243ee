@@ -8,39 +8,62 @@
 #           （取消后的迟到完成不会留索引/报成功）
 #   场景 3  清理失败自动重试（HYDRO_CLEANUP_FAIL_FIRST 注入）
 #   场景 4  API 重启恢复：停遗留构建、清残件；成功索引与人工索引保留
+#   场景 5  按站归档：界线只前进、重复提交幂等、迟到直写归档、跨表查询完整
 #
 # 用法：
 #   ./demo/demo.sh up        # 构建并启动 compose（首次）
-#   ./demo/demo.sh all       # 依次跑场景 1~4（默认）
-#   ./demo/demo.sh 1|2|3|4   # 只跑单个场景
+#   ./demo/demo.sh all       # 依次跑场景 1~5（默认）
+#   ./demo/demo.sh 1|2|3|4|5 # 只跑单个场景
 #
 # 依赖：docker compose、curl、jq（缺失 jq 时脚本自动降级为 python3 -m json.tool）
 # =============================================================================
 set -euo pipefail
 
 BASE="${BASE:-http://localhost:8000}"
+BASE2="${BASE2:-http://localhost:8001}"   # 第二个 API 实例（多实例归档演示）
 IDX="idx_readings_station_observed"
 PSQL=(docker exec -i hydro-db psql -U hydro -d hydro_warehouse -tA)
 
 if command -v jq >/dev/null 2>&1; then
   jqr() { jq -r "$1"; }
 else
-  # 无 jq 时的降级：覆盖本脚本实际用到的表达式形态
+  # 无 jq 时的降级：支持简单键（.a.b）、字符串插值（"text \(.key)"）、
+  # .[N] | "..." 与 .[] | "..." 形态；布尔按 jq 风格输出 true/false
   jqr() {
     local expr="$1"
-    python3 - "$expr" <<'PY'
-import sys, json
-expr = sys.argv[1]
+    python3 -c '
+import sys, json, re
+expr = sys.argv[1].strip()
 d = json.load(sys.stdin)
-if expr == ".[0] | \"read query ok, latest id=\\(.id)\"":
-    print(f"read query ok, latest id={d[0]['id']}")
-elif expr == ".[] | \"id=\\(.id) state=\\(.state) phase=\\(.phase)\"":
-    for r in d:
-        print(f"id={r['id']} state={r['state']} phase={r['phase']}")
+
+def fmt(v):
+    if v is True: return "true"
+    if v is False: return "false"
+    if v is None: return "null"
+    return str(v)
+
+def lookup(obj, path):
+    cur = obj
+    for part in path.strip(".").split("."):
+        if part:
+            cur = cur[int(part)] if isinstance(cur, list) else cur[part]
+    return cur
+
+def interp(tmpl, obj):
+    return re.sub(r"\\\(\s*(\.[A-Za-z0-9_.]+)\s*\)",
+                  lambda m: fmt(lookup(obj, m.group(1))), tmpl)
+
+m = re.match(r"^\.\[(\d+)\]\s*\|\s*\"(.*)\"$", expr)
+if m:
+    print(interp(m.group(2), d[int(m.group(1))]))
+elif expr.startswith(".[] | \"") and expr.endswith("\""):
+    for item in d:
+        print(interp(expr[7:-1], item))
+elif expr.startswith("\"") and expr.endswith("\""):
+    print(interp(expr[1:-1], d))
 else:
-    key = expr.lstrip(".")
-    print(d[key])
-PY
+    print(fmt(lookup(d, expr)))
+' "$expr"
   }
 fi
 
@@ -48,12 +71,12 @@ c() { printf '\n\033[1;36m── %s\033[0m\n' "$*"; }
 ok() { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-req() { # method path [data]
-  local m="$1" p="$2" d="${3:-}"
+req() { # method path [data] [base]
+  local m="$1" p="$2" d="${3:-}" b="${4:-$BASE}"
   if [[ -n "$d" ]]; then
-    curl -fsS -X "$m" "$BASE$p" -H 'Content-Type: application/json' -d "$d"
+    curl -fsS -X "$m" "$b$p" -H 'Content-Type: application/json' -d "$d"
   else
-    curl -fsS -X "$m" "$BASE$p"
+    curl -fsS -X "$m" "$b$p"
   fi
 }
 
@@ -276,6 +299,78 @@ scenario4() {
   ok "管理索引 valid、人工索引 idx_readings_ingested_manual 完好"
 }
 
+# --------------------------------------------------------------------------- #
+scenario5() {
+  c "场景 5：按站归档——界线只前进、重复提交幂等、迟到直写归档、跨表查询完整"
+  local ST=5
+  c "5.0 确认第二个 API 实例（$BASE2）就绪"
+  for i in $(seq 1 30); do
+    if curl -fsS "$BASE2/health" >/dev/null 2>&1; then ok "实例 2 就绪"; break; fi
+    [[ "$i" == "30" ]] && die "实例 2（$BASE2）未就绪，请用新版 docker-compose.yml 启动"
+    sleep 2
+  done
+
+  c "5.1 归档站 $ST 早于 2026-01-01 的观测（连原 ID 迁入归档表）"
+  local before_hot before_total
+  before_hot=$("${PSQL[@]}" -c "SELECT count(*) FROM readings WHERE station_id=$ST")
+  local r
+  r=$(req POST /archive "{\"station_id\":$ST,\"cutoff\":\"2026-01-01T00:00:00Z\"}")
+  echo "$r" | python3 -m json.tool
+  local moved
+  moved=$(echo "$r" | jqr '.moved_count')
+  [[ "$moved" -gt 0 ]] || die "应迁出大于 0 行"
+  ok "迁出 $moved 行（热表原有 $before_hot 行）"
+
+  c "5.2 重复提交同一界线 → 幂等（moved_count=0, idempotent_replay=true）"
+  r=$(req POST /archive "{\"station_id\":$ST,\"cutoff\":\"2026-01-01T00:00:00Z\"}")
+  [[ "$(echo "$r" | jqr '.moved_count')" == "0" ]] || die "重复提交不应再搬迁"
+  [[ "$(echo "$r" | jqr '.idempotent_replay')" == "true" ]] || die "应标记幂等重放"
+  ok "幂等重放确认"
+
+  c "5.3 界线倒退必须被拒（409）"
+  if req POST /archive "{\"station_id\":$ST,\"cutoff\":\"2025-01-01T00:00:00Z\"}" 2>/dev/null; then
+    die "界线只许前进，倒退应 409"
+  else
+    ok "倒退 cutoff 被 409 拒绝"
+  fi
+
+  c "5.4 经第二个 API 实例（$BASE2）推进界线（多实例并发安全）"
+  r=$(req POST /archive "{\"station_id\":$ST,\"cutoff\":\"2026-03-01T00:00:00Z\"}" "$BASE2")
+  echo "$r" | jqr '"实例2推进界线: moved=\(.moved_count) replay=\(.idempotent_replay)"'
+
+  c "5.5 迟到旧观测（早于界线）→ 直接写入归档表"
+  r=$(req POST /readings "{\"station_id\":$ST,\"observed_at\":\"2026-01-15T08:00:00Z\",\"water_level\":19.9}")
+  echo "$r" | jqr '"迟到写入: id=\(.id) source=\(.source)"'
+  [[ "$(echo "$r" | jqr '.source')" == "archive" ]] || die "迟到观测应直写归档表"
+  r=$(req POST /readings "{\"station_id\":$ST,\"observed_at\":\"2026-11-14T08:00:00Z\",\"water_level\":22.5}")
+  [[ "$(echo "$r" | jqr '.source')" == "hot" ]] || die "新观测应写热表"
+  ok "迟到观测直写归档、新观测写热表"
+
+  c "5.6 跨两表查询：完整、不重复"
+  req GET "/readings?station_id=$ST&start=2025-12-01T00:00:00Z&end=2026-04-01T00:00:00Z&limit=1000" \
+    | python3 -c "
+import json, sys
+rows = json.load(sys.stdin)
+ids = [r['id'] for r in rows]
+srcs = {r['source'] for r in rows}
+assert len(ids) == len(set(ids)), '存在重复 id!'
+print(f'  跨表返回 {len(rows)} 行, 来源={sorted(srcs)}, 无重复 id')
+"
+
+  c "5.7 界线与两表行数核对（hot + archived = 归档前总数 + 新写入）"
+  req GET "/archive/boundaries/$ST" | python3 -m json.tool
+  local total_now
+  total_now=$("${PSQL[@]}" -c "
+    SELECT (SELECT count(*) FROM readings WHERE station_id=$ST)
+         + (SELECT count(*) FROM readings_archive WHERE station_id=$ST)")
+  ok "行数守恒: $before_hot + 2 条新写入 = $total_now（不漏数）"
+  "${PSQL[@]}" -c "
+    SELECT count(*) AS leaked FROM readings r
+    JOIN archive_boundaries b ON b.station_id = r.station_id
+    WHERE r.station_id = $ST AND r.observed_at < b.cutoff" \
+    | { read -r n; [[ "$n" == "0" ]] && ok "热表无早于界线的漏迁记录" || die "存在漏迁记录"; }
+}
+
 main() {
   local what="${1:-all}"
   case "$what" in
@@ -284,15 +379,17 @@ main() {
     2) wait_health; scenario2 ;;
     3) wait_health; scenario3 ;;
     4) wait_health; scenario4 ;;
+    5) wait_health; scenario5 ;;
     all)
       up
       scenario1
       scenario2
       scenario3
       scenario4
+      scenario5
       c "全部场景演示完成"
       ;;
-    *) die "用法: $0 [up|all|1|2|3|4]" ;;
+    *) die "用法: $0 [up|all|1|2|3|4|5]" ;;
   esac
 }
 main "$@"

@@ -27,6 +27,37 @@ CREATE TABLE IF NOT EXISTS readings (
 
 COMMENT ON TABLE readings IS '水位明细（高频观测，持续写入）';
 
+-- 归档表：结构与热表一致；id 与热表共用 readings_id_seq 序列，
+-- 搬迁保留原 id、迟到直写归档取新 id，两表 id 全局唯一（跨表查询不重复）
+CREATE TABLE IF NOT EXISTS readings_archive (
+    id           BIGINT NOT NULL DEFAULT nextval('readings_id_seq'),
+    station_id   BIGINT NOT NULL,
+    observed_at  TIMESTAMPTZ NOT NULL,
+    water_level  NUMERIC(8, 3) NOT NULL,
+    discharge    NUMERIC(12, 3),
+    quality      TEXT NOT NULL DEFAULT 'GOOD',
+    ingested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    archived_at  TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 何时迁入/直写归档
+    CONSTRAINT pk_readings_archive PRIMARY KEY (id),
+    CONSTRAINT fk_readings_archive_station FOREIGN KEY (station_id)
+        REFERENCES stations (station_id)
+);
+
+COMMENT ON TABLE readings_archive IS '水位明细归档（按站+UTC 截止时刻从热表迁入）';
+
+CREATE INDEX IF NOT EXISTS idx_readings_archive_station_observed
+    ON readings_archive (station_id, observed_at);
+
+-- 归档界线：每站一条，observed_at < cutoff 的观测属于归档；界线只许前进
+CREATE TABLE IF NOT EXISTS archive_boundaries (
+    station_id  BIGINT PRIMARY KEY
+        REFERENCES stations (station_id),
+    cutoff      TIMESTAMPTZ NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE archive_boundaries IS '按站归档界线（只前进；与搬迁同事务提交）';
+
 -- 10 个测站
 INSERT INTO stations (station_id, station_code, station_name, basin)
 SELECT s,

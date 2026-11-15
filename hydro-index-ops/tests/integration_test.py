@@ -1,17 +1,20 @@
 """端到端集成测试：真实 PostgreSQL 16 + 真实 uvicorn 子进程。
 
 前置：
-  - PG 实例已在 127.0.0.1:55432 运行，库 hydro_warehouse 已执行 sql/01_init_readings.sql
+  - PG 实例已就绪，库 hydro_warehouse 已执行 sql/01_init_readings.sql
+    （默认连接 127.0.0.1:55432，可用环境变量 HYDRO_TEST_PG_DSN 覆盖）
   - 依赖已安装（fastapi/uvicorn/psycopg/httpx）
 
 运行：python tests/integration_test.py
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -20,9 +23,14 @@ import psycopg
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE = "http://127.0.0.1:8011"
-DSN = "postgresql://hydro@127.0.0.1:55432/hydro_warehouse"
+BASE2 = "http://127.0.0.1:8012"
+DSN = os.environ.get(
+    "HYDRO_TEST_PG_DSN", "postgresql://hydro@127.0.0.1:55432/hydro_warehouse"
+)
 IDX = "idx_readings_station_observed"
 MANUAL_IDX = "idx_readings_ingested_manual"
+# 与应用 app/archive.py 中的咨询锁命名空间一致（测试用它从外部持锁制造竞争）
+ARCHIVE_LOCK_NS = "hydro-archive-station"
 
 PASS = 0
 FAIL = 0
@@ -39,8 +47,9 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 class ApiServer:
-    def __init__(self, extra_env: dict | None = None) -> None:
+    def __init__(self, port: int = 8011, extra_env: dict | None = None) -> None:
         self.proc: subprocess.Popen | None = None
+        self.port = port
         self.extra_env = extra_env or {}
 
     def start(self) -> None:
@@ -49,12 +58,14 @@ class ApiServer:
         env["HYDRO_WORK_POLL_INTERVAL"] = "0.5"
         env["HYDRO_CLEANUP_RETRY_INTERVAL"] = "1.0"
         env.update(self.extra_env)
+        base = f"http://127.0.0.1:{self.port}"
         # SIGKILL 后监听端口可能短暂处于未释放状态，重试若干次
         last_out = ""
         for attempt in range(10):
             self.proc = subprocess.Popen(
                 [sys.executable, "-m", "uvicorn", "app.main:app",
-                 "--host", "127.0.0.1", "--port", "8011", "--log-level", "warning"],
+                 "--host", "127.0.0.1", "--port", str(self.port),
+                 "--log-level", "warning"],
                 cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True,
             )
@@ -64,7 +75,7 @@ class ApiServer:
                     self.proc = None
                     break
                 try:
-                    r = httpx.get(f"{BASE}/health", timeout=1)
+                    r = httpx.get(f"{base}/health", timeout=1)
                     if r.status_code == 200:
                         return
                 except httpx.TransportError:
@@ -112,8 +123,8 @@ async def backend_alive(pid: int) -> bool:
     return bool(rows)
 
 
-def http(method: str, path: str, **kw):
-    r = httpx.request(method, f"{BASE}{path}", timeout=15, **kw)
+def http(method: str, path: str, base: str = BASE, **kw):
+    r = httpx.request(method, f"{base}{path}", timeout=15, **kw)
     return r
 
 
@@ -342,6 +353,285 @@ async def main() -> int:
     check("历史覆盖 SUCCEEDED/CANCELLED/FAILED",
           {"SUCCEEDED", "CANCELLED", "FAILED"}.issubset(states), str(states))
 
+    # ------------------------------------------------------------------ #
+    print("场景 6：按站归档——界线只前进、重复提交幂等、原 ID 保留")
+    # 站 6 种子数据按时间排序取 1/4 与中位时刻作为两条界线
+    rows = await pg_exec(
+        "SELECT observed_at FROM readings WHERE station_id=6 ORDER BY observed_at"
+    )
+    ts = [r[0] for r in rows]
+    cut1 = ts[2500].isoformat()  # 恰好 2500 行更早
+    cut2 = ts[5000].isoformat()  # 恰好 5000 行更早
+
+    before = await pg_exec(
+        "SELECT id FROM readings WHERE station_id=6 AND observed_at < %s", (cut1,)
+    )
+    r = http("POST", "/archive", json={"station_id": 6, "cutoff": cut1})
+    check("首次归档 200", r.status_code == 200, r.text)
+    d = r.json()
+    check("搬迁行数=2500", d["moved_count"] == 2500, str(d))
+    check("首次归档非重放、无前界线",
+          d["idempotent_replay"] is False and d["previous_cutoff"] is None, str(d))
+    after = await pg_exec("SELECT id FROM readings_archive WHERE station_id=6")
+    check("归档行连原 ID 迁移",
+          sorted(x[0] for x in before) == sorted(x[0] for x in after))
+
+    r = http("POST", "/archive", json={"station_id": 6, "cutoff": cut1})
+    d = r.json()
+    check("重复提交 200 且幂等（不再搬迁）",
+          r.status_code == 200 and d["moved_count"] == 0 and d["idempotent_replay"] is True,
+          str(d))
+
+    r = http("POST", "/archive", json={"station_id": 6, "cutoff": ts[1000].isoformat()})
+    check("界线倒退被拒 409", r.status_code == 409, r.text)
+
+    r = http("POST", "/archive", json={"station_id": 6, "cutoff": cut2})
+    d = r.json()
+    check("界线前进继续搬迁 2500 行",
+          r.status_code == 200 and d["moved_count"] == 2500, str(d))
+
+    b = http("GET", "/archive/boundaries/6").json()
+    check("界线详情行数守恒（hot+archive=10000）",
+          b["hot_rows"] + b["archived_rows"] == 10000, str(b))
+    check("界线列表可查",
+          any(x["station_id"] == 6 for x in http("GET", "/archive/boundaries").json()))
+    dup = await pg_exec(
+        "SELECT count(*) FROM readings r JOIN readings_archive a ON a.id=r.id "
+        "WHERE r.station_id=6"
+    )
+    check("两表 id 无交集", dup[0][0] == 0)
+    leaked = await pg_exec(
+        "SELECT count(*) FROM readings WHERE station_id=6 AND observed_at < %s", (cut2,)
+    )
+    check("热表无早于界线的记录", leaked[0][0] == 0)
+
+    r = http("POST", "/archive", json={"station_id": 999, "cutoff": cut1})
+    check("未知站号 404", r.status_code == 404, r.text)
+    r = http("POST", "/archive", json={"station_id": 6, "cutoff": "2026-01-01T00:00:00"})
+    check("cutoff 不带时区 422", r.status_code == 422, r.text)
+    r = http("GET", "/archive/boundaries/999")
+    check("无界线站查询 404", r.status_code == 404)
+
+    # ------------------------------------------------------------------ #
+    print("场景 7：迟到旧观测直写归档表；按站时查询跨两表完整不重复")
+    rows = await pg_exec(
+        "SELECT observed_at FROM readings WHERE station_id=7 ORDER BY observed_at"
+    )
+    cut7 = rows[5000][0].isoformat()
+    r = http("POST", "/archive", json={"station_id": 7, "cutoff": cut7})
+    check("站7归档 5000 行", r.json()["moved_count"] == 5000, r.text)
+
+    r = http("POST", "/readings", json={
+        "station_id": 7, "observed_at": rows[100][0].isoformat(), "water_level": 9.9})
+    check("迟到旧观测写入归档表",
+          r.status_code == 201 and r.json()["source"] == "archive"
+          and r.json()["archived_at"] is not None, r.text)
+    r = http("POST", "/readings", json={
+        "station_id": 7, "observed_at": "2099-01-01T00:00:00Z", "water_level": 1.1})
+    check("新观测写入热表", r.status_code == 201 and r.json()["source"] == "hot")
+    r = http("POST", "/readings", json={
+        "station_id": 7, "observed_at": cut7, "water_level": 2.2})
+    check("等于界线的观测仍写热表（界线为严格小于）",
+          r.status_code == 201 and r.json()["source"] == "hot", r.text)
+
+    # 跨界线窗口查询：完整、不重复、来源与界线一致
+    from datetime import datetime as _dt
+    start, end = rows[4990][0].isoformat(), rows[5010][0].isoformat()
+    got = http("GET", "/readings", params={
+        "station_id": 7, "start": start, "end": end, "limit": 1000}).json()
+    ids = [x["id"] for x in got]
+    check("跨界线查询无重复 id", len(ids) == len(set(ids)), str(len(ids)))
+    check("跨界线查询同时覆盖两表",
+          {x["source"] for x in got} == {"hot", "archive"},
+          str({x["source"] for x in got}))
+    cut7_dt = _dt.fromisoformat(cut7)
+    ok_split = all(
+        (x["source"] == "archive") == (_dt.fromisoformat(x["observed_at"]) < cut7_dt)
+        for x in got
+    )
+    check("查询结果来源与界线一致", ok_split)
+    b = http("GET", "/archive/boundaries/7").json()
+    check("站7行数守恒（含 3 条新写入）",
+          b["hot_rows"] + b["archived_rows"] == 10000 + 3, str(b))
+
+    # ------------------------------------------------------------------ #
+    print("场景 8：两个 API 实例并发写入与推进界线——不漏迁、不错放")
+    srv2 = ApiServer(port=8012)
+    srv2.start()
+    check("第二实例就绪（worker 咨询锁保证仅一个实例驱动状态机）",
+          http("GET", "/health", base=BASE2).status_code == 200)
+
+    async def reset_station(st: int) -> None:
+        await pg_exec("DELETE FROM readings WHERE station_id=%s", (st,))
+        await pg_exec("DELETE FROM readings_archive WHERE station_id=%s", (st,))
+        await pg_exec("DELETE FROM archive_boundaries WHERE station_id=%s", (st,))
+
+    async def station_counts(st: int) -> tuple[int, int, int]:
+        hot = (await pg_exec("SELECT count(*) FROM readings WHERE station_id=%s", (st,)))[0][0]
+        arc = (await pg_exec("SELECT count(*) FROM readings_archive WHERE station_id=%s", (st,)))[0][0]
+        dup = (await pg_exec(
+            "SELECT count(*) FROM readings r JOIN readings_archive a ON a.id=r.id "
+            "WHERE r.station_id=%s", (st,)))[0][0]
+        return hot, arc, dup
+
+    # 8a 自由竞速：实例1 跨界线写入 40 条，实例2 同时推进界线
+    await reset_station(8)
+    CUT8 = "2026-09-01T00:00:00Z"
+    inserted: list[tuple[int, str]] = []
+    errors: list[str] = []
+
+    def insert_one(i: int) -> None:
+        ts = (f"2026-08-{10 + i % 20:02d}T{i % 24:02d}:00:00Z" if i % 2 == 0
+              else f"2026-09-{10 + i % 20:02d}T{i % 24:02d}:00:00Z")
+        try:
+            rr = httpx.post(f"{BASE}/readings", json={
+                "station_id": 8, "observed_at": ts, "water_level": float(i)}, timeout=30)
+            if rr.status_code == 201:
+                inserted.append((rr.json()["id"], ts))
+            else:
+                errors.append(f"insert {i}: {rr.status_code}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"insert {i}: {exc}")
+
+    def archive_one() -> None:
+        rr = httpx.post(f"{BASE2}/archive",
+                        json={"station_id": 8, "cutoff": CUT8}, timeout=30)
+        if rr.status_code != 200:
+            errors.append(f"archive: {rr.status_code} {rr.text[:80]}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as ex:
+        futs = [ex.submit(insert_one, i) for i in range(40)]
+        futs.insert(20, ex.submit(archive_one))
+        for f in futs:
+            f.result()
+    check("竞速期间无请求失败", not errors, str(errors[:3]))
+    check("40 条写入全部受理", len(inserted) == 40, str(len(inserted)))
+    loc = {r[0]: r[1] for r in await pg_exec(
+        "SELECT id, 'hot' FROM readings WHERE station_id=8 "
+        "UNION ALL SELECT id, 'arc' FROM readings_archive WHERE station_id=8")}
+    misplaced = [(rid, ts) for rid, ts in inserted
+                 if loc.get(rid) != ("arc" if ts < CUT8 else "hot")]
+    check("每条观测按最终界线落位正确（不错放）", not misplaced, str(misplaced[:3]))
+    hot, arc, dup = await station_counts(8)
+    check("行数守恒且无重复 id（不漏迁）",
+          hot + arc == 40 and dup == 0, f"hot={hot} arc={arc} dup={dup}")
+    leaked = (await pg_exec(
+        "SELECT count(*) FROM readings WHERE station_id=8 AND observed_at < %s",
+        (CUT8,)))[0][0]
+    check("热表无漏迁旧记录", leaked == 0)
+
+    # 8b 两实例并发不同 cutoff：终态界线=较大者
+    await reset_station(8)
+    for i in range(10):
+        http("POST", "/readings", json={"station_id": 8,
+             "observed_at": f"2026-01-{i + 1:02d}T00:00:00Z", "water_level": 1.0})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(httpx.post, f"{BASE}/archive",
+                       json={"station_id": 8, "cutoff": "2026-01-05T00:00:00Z"}, timeout=30)
+        f2 = ex.submit(httpx.post, f"{BASE2}/archive",
+                       json={"station_id": 8, "cutoff": "2026-01-08T00:00:00Z"}, timeout=30)
+        r1, r2 = f1.result(), f2.result()
+    codes = sorted([r1.status_code, r2.status_code])
+    check("并发不同界线：双双成功或落后者 409", codes in ([200, 200], [200, 409]), str(codes))
+    b = http("GET", "/archive/boundaries/8").json()
+    check("终态界线为较大 cutoff", b["cutoff"].startswith("2026-01-08T00:00:00"), str(b))
+    hot, arc, dup = await station_counts(8)
+    check("界线以下的 7 行全部且仅一次归档", arc == 7 and dup == 0, f"arc={arc} dup={dup}")
+
+    # 8c 两实例并发相同 cutoff：幂等，合计只迁一次
+    await reset_station(8)
+    for i in range(6):
+        http("POST", "/readings", json={"station_id": 8,
+             "observed_at": f"2026-02-{i + 1:02d}T00:00:00Z", "water_level": 1.0})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(httpx.post, f"{BASE}/archive",
+                       json={"station_id": 8, "cutoff": "2026-02-10T00:00:00Z"}, timeout=30)
+        f2 = ex.submit(httpx.post, f"{BASE2}/archive",
+                       json={"station_id": 8, "cutoff": "2026-02-10T00:00:00Z"}, timeout=30)
+        r1, r2 = f1.result(), f2.result()
+    moved_total = r1.json()["moved_count"] + r2.json()["moved_count"]
+    replays = int(r1.json()["idempotent_replay"]) + int(r2.json()["idempotent_replay"])
+    check("并发相同界线：合计只迁 6 行", moved_total == 6, str(moved_total))
+    check("恰有一个请求为幂等重放", replays == 1, str(replays))
+    await reset_station(8)
+
+    # ------------------------------------------------------------------ #
+    print("场景 9：归档失败/服务重启——数据与界线保持同一已提交状态")
+    # 9a 注入归档表写入失败 → 归档 500 且整体回滚
+    await pg_exec(
+        "CREATE OR REPLACE FUNCTION hydro_test_fail() RETURNS trigger LANGUAGE plpgsql "
+        "AS $$ BEGIN RAISE EXCEPTION 'injected archive failure'; END; $$"
+    )
+    await pg_exec(
+        "CREATE TRIGGER trg_hydro_test_fail BEFORE INSERT ON readings_archive "
+        "FOR EACH ROW EXECUTE FUNCTION hydro_test_fail()"
+    )
+    r = http("POST", "/archive",
+             json={"station_id": 9, "cutoff": "2026-06-01T00:00:00Z"})
+    check("归档中途失败返回 500", r.status_code == 500, r.text)
+    hot, arc, _ = await station_counts(9)
+    bnd = await pg_exec("SELECT count(*) FROM archive_boundaries WHERE station_id=9")
+    check("失败后数据与界线保持原状（整体回滚）",
+          hot == 10000 and arc == 0 and bnd[0][0] == 0, f"hot={hot} arc={arc}")
+    await pg_exec("DROP TRIGGER trg_hydro_test_fail ON readings_archive")
+    await pg_exec("DROP FUNCTION hydro_test_fail()")
+    r = http("POST", "/archive",
+             json={"station_id": 9, "cutoff": "2026-06-01T00:00:00Z"})
+    check("故障解除后重试成功", r.status_code == 200 and r.json()["moved_count"] > 0, r.text)
+
+    # 9b 归档被按站锁挡住时 SIGKILL：状态不变；重启后重试成功
+    lock_conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    await lock_conn.execute(
+        "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+        (f"{ARCHIVE_LOCK_NS}:10",),
+    )
+    outcome: dict = {}
+
+    def blocked_archive() -> None:
+        try:
+            outcome["r"] = httpx.post(
+                f"{BASE}/archive",
+                json={"station_id": 10, "cutoff": "2026-06-01T00:00:00Z"}, timeout=30)
+        except Exception as exc:  # noqa: BLE001  服务被杀，连接断开
+            outcome["err"] = exc
+
+    t = threading.Thread(target=blocked_archive)
+    t.start()
+    time.sleep(2)
+    check("归档请求被按站锁阻塞", not outcome)
+    # 阻塞期间其他站写入照常（按站隔离）
+    t0 = time.time()
+    r = http("POST", "/readings", json={
+        "station_id": 3, "observed_at": "2026-11-15T01:00:00Z", "water_level": 2.2})
+    check("站10归档阻塞期间其他站写入照常",
+          r.status_code == 201 and time.time() - t0 < 5, r.text)
+
+    srv.stop(sig=signal.SIGKILL)  # 模拟服务崩溃/容器重启
+    t.join(timeout=15)
+    check("崩溃后归档请求已断开", "err" in outcome or
+          (outcome.get("r") is not None and outcome["r"].status_code >= 500))
+    hot, arc, _ = await station_counts(10)
+    bnd = await pg_exec("SELECT count(*) FROM archive_boundaries WHERE station_id=10")
+    check("SIGKILL 后数据与界线保持同一已提交状态",
+          hot == 10000 and arc == 0 and bnd[0][0] == 0, f"hot={hot} arc={arc}")
+    await lock_conn.execute(
+        "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+        (f"{ARCHIVE_LOCK_NS}:10",),
+    )
+    await lock_conn.close()
+
+    srv = ApiServer()
+    srv.start()
+    r = http("POST", "/archive",
+             json={"station_id": 10, "cutoff": "2026-06-01T00:00:00Z"})
+    check("重启后重试归档成功", r.status_code == 200 and r.json()["moved_count"] > 0, r.text)
+    hot, arc, dup = await station_counts(10)
+    bnd = await pg_exec("SELECT cutoff FROM archive_boundaries WHERE station_id=10")
+    check("重启后数据与界线一致（hot+archive=10000，界线已推进）",
+          hot + arc == 10000 and dup == 0 and bnd and bnd[0][0] is not None,
+          f"hot={hot} arc={arc}")
+
+    srv2.stop()
     srv.stop()
     print(f"\n结果：{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

@@ -35,9 +35,29 @@ services:
       HYDRO_CLEANUP_RETRY_INTERVAL: "3.0"
       # 演示用：让前 N 次清理 DROP 故意失败，观察 PENDING 自动重试（生产置 0）
       HYDRO_CLEANUP_FAIL_FIRST: "0"
+      # 归档/写入路由等待按站咨询锁的最长时间（毫秒），超时返回 409 可重试
+      HYDRO_ARCHIVE_LOCK_TIMEOUT_MS: "10000"
       HYDRO_LOG_LEVEL: INFO
     ports:
       - "8000:8000"
+
+  # 第二个 API 实例：验证多实例并发写入/推进界线时观测不漏迁、不错放。
+  # 索引构建 worker 由咨询锁保证全局只有一个实例驱动，另一实例仅提供 API。
+  api2:
+    build: .
+    container_name: hydro-api2
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HYDRO_PG_DSN: postgresql://hydro:hydro_pw@db:5432/hydro_warehouse
+      HYDRO_WORK_POLL_INTERVAL: "1.0"
+      HYDRO_CLEANUP_RETRY_INTERVAL: "3.0"
+      HYDRO_CLEANUP_FAIL_FIRST: "0"
+      HYDRO_ARCHIVE_LOCK_TIMEOUT_MS: "10000"
+      HYDRO_LOG_LEVEL: INFO
+    ports:
+      - "8001:8000"
 
 volumes:
   pgdata:

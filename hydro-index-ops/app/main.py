@@ -1,4 +1,4 @@
-"""FastAPI 入口：批次受理/查询/取消、水位明细读写、长事务演示。
+"""FastAPI 入口：批次受理/查询/取消、水位明细读写、按站归档、长事务演示。
 
 Swagger UI:  http://localhost:8000/docs
 ReDoc:       http://localhost:8000/redoc
@@ -9,17 +9,28 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from datetime import datetime, timezone
 
 import psycopg
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from psycopg_pool import AsyncConnectionPool
 
+from . import archive
 from . import db
 from . import sql_helpers as sql
 from .config import settings
 from .db import close_pool, init_pool
-from .models import BatchCreate, BatchOut, LongTxOut, ReadingIn, ReadingOut
+from .models import (
+    ArchiveOut,
+    ArchiveRequest,
+    BatchCreate,
+    BatchOut,
+    BoundaryOut,
+    LongTxOut,
+    ReadingIn,
+    ReadingOut,
+)
 from .worker import TERMINAL_STATES, worker
 
 logging.basicConfig(
@@ -56,15 +67,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="水文数仓 · 水位明细索引运维 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "在 PostgreSQL `readings(station_id, observed_at)` 上以 "
-        "**CREATE INDEX CONCURRENTLY** 构建普通复合索引的批次化运维服务。\n\n"
+        "**CREATE INDEX CONCURRENTLY** 构建普通复合索引的批次化运维服务，"
+        "并支持**按站号 + UTC 截止时刻**把旧水位从热表归档到 `readings_archive`。\n\n"
+        "索引构建：\n"
         "- 同一时刻只受理一个批次，可查询构建阶段与错误、可取消；\n"
         "- 取消或失败必须等构建会话结束、索引残件删净才进入终态并接收新批；\n"
         "- 清理失败保留待处理状态并自动重试，期间源表普通读写照常；\n"
         "- 批次状态持久化，重启后先停遗留构建、清残件再接新批；\n"
-        "- 只管理固定名称索引与自有构建会话，不删人工索引、不断其他会话。"
+        "- 只管理固定名称索引与自有构建会话，不删人工索引、不断其他会话。\n\n"
+        "按站归档：\n"
+        "- `POST /archive` 按站号 + UTC 截止时刻把热表旧观测**连原 ID** 迁入归档表；\n"
+        "- 界线只许前进（倒退 409），重复提交幂等不重复搬迁；\n"
+        "- 搬迁与界线推进同一事务提交，失败/重启后数据与界线保持一致；\n"
+        "- 迟到旧观测由 `POST /readings` 直接写入归档表；\n"
+        "- `GET /readings` 跨热表+归档表返回完整记录，不重复；\n"
+        "- 按站咨询锁保证多实例并发下不漏迁、不错放，其他站写照常。"
     ),
     lifespan=lifespan,
 )
@@ -228,44 +248,45 @@ async def cancel_batch(
 
 
 # --------------------------------------------------------------------------- #
-# 水位明细：构建期间普通读写照常
+# 水位明细：构建期间普通读写照常；迟到旧观测按界线直接写入归档表
 # --------------------------------------------------------------------------- #
 @app.post(
     "/readings",
     response_model=ReadingOut,
     status_code=status.HTTP_201_CREATED,
     tags=["readings"],
-    summary="写入一条水位观测（索引构建/等待/清理期间始终可用）",
+    summary="写入一条水位观测（晚于归档界线的旧观测自动写入归档表）",
 )
 async def insert_reading(
     body: ReadingIn, p: AsyncConnectionPool = Depends(get_pool)
 ) -> ReadingOut:
     async with p.connection() as conn:
         try:
-            cur = await conn.execute(
-                """
-                INSERT INTO readings
-                    (station_id, observed_at, water_level, discharge, quality)
-                VALUES (%(station_id)s, %(observed_at)s, %(water_level)s,
-                        %(discharge)s, %(quality)s)
-                RETURNING id, station_id, observed_at, water_level, discharge,
-                          quality, ingested_at
-                """,
-                body.model_dump(),
+            row, source = await archive.insert_reading_routed(
+                conn, body.model_dump()
             )
-            row = await cur.fetchone()
             await conn.commit()
+        except archive.ArchiveLockTimeout:
+            await conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=(
+                    f"station {body.station_id} is being archived by another "
+                    "request; retry shortly"
+                ),
+            )
         except psycopg.Error as exc:
             await conn.rollback()
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
-    return ReadingOut(**row)
+    log.info("reading %s routed to %s (station %s)", row["id"], source, body.station_id)
+    return ReadingOut(**row, source=source)
 
 
 @app.get(
     "/readings",
     response_model=list[ReadingOut],
     tags=["readings"],
-    summary="按站号+时间查询水位明细（索引建成后走复合索引）",
+    summary="按站号+时间查询水位明细（跨热表+归档表，完整且不重复）",
 )
 async def query_readings(
     station_id: int = Query(..., description="站号"),
@@ -274,19 +295,8 @@ async def query_readings(
     limit: int = Query(100, ge=1, le=1000),
     p: AsyncConnectionPool = Depends(get_pool),
 ) -> list[ReadingOut]:
-    clauses = ["station_id = %(station_id)s"]
-    params: dict = {"station_id": station_id, "limit": limit}
-    if start:
-        clauses.append("observed_at >= %(start)s")
-        params["start"] = start
-    if end:
-        clauses.append("observed_at <= %(end)s")
-        params["end"] = end
-    sql_text = (
-        "SELECT id, station_id, observed_at, water_level, discharge, quality, ingested_at "
-        "FROM readings WHERE " + " AND ".join(clauses) +
-        " ORDER BY observed_at DESC LIMIT %(limit)s"
-    )
+    sql_text, params = archive.union_query(station_id, start, end)
+    params["limit"] = limit
     async with p.connection() as conn:
         try:
             cur = await conn.execute(sql_text, params)
@@ -316,6 +326,108 @@ async def explain_readings(
         plan = await cur.fetchall()
         await conn.commit()
     return {"plan": plan}
+
+
+# --------------------------------------------------------------------------- #
+# 按站归档：界线只许前进；搬迁与界线推进同一事务提交
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/archive",
+    response_model=ArchiveOut,
+    tags=["archive"],
+    summary="按站号+UTC 截止时刻归档：早于界线的热表观测连原 ID 迁入归档表",
+    responses={
+        status.HTTP_409_CONFLICT: {
+            "description": "cutoff 落后于当前界线（界线只许前进），或同站归档进行中"
+        },
+        status.HTTP_404_NOT_FOUND: {"description": "站号不存在"},
+    },
+)
+async def archive_station(
+    body: ArchiveRequest, p: AsyncConnectionPool = Depends(get_pool)
+) -> ArchiveOut:
+    async with p.connection() as conn:
+        try:
+            result = await archive.archive_station(
+                conn, body.station_id, body.cutoff
+            )
+            await conn.commit()
+        except archive.ArchiveRegression as exc:
+            await conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=(
+                    f"boundary for station {body.station_id} is already at "
+                    f"{exc.current.isoformat()}; cutoff may only move forward"
+                ),
+            )
+        except archive.StationNotFound:
+            await conn.rollback()
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                detail=f"station {body.station_id} not found",
+            )
+        except archive.ArchiveLockTimeout:
+            await conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=(
+                    f"station {body.station_id} is being archived by another "
+                    "request; retry shortly"
+                ),
+            )
+        except psycopg.Error as exc:
+            # 搬迁与界线推进在同一事务，失败整体回滚：
+            # 数据与界线保持同一已提交状态，可安全重试
+            await conn.rollback()
+            log.exception("archive failed for station %s", body.station_id)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"archive failed, rolled back unchanged: {exc}",
+            )
+    return ArchiveOut(
+        station_id=body.station_id,
+        cutoff=body.cutoff,
+        previous_cutoff=result["previous_cutoff"],
+        moved_count=result["moved_count"],
+        idempotent_replay=result["idempotent_replay"],
+        executed_at=datetime.now(timezone.utc),
+    )
+
+
+@app.get(
+    "/archive/boundaries",
+    response_model=list[BoundaryOut],
+    tags=["archive"],
+    summary="全部测站的归档界线",
+)
+async def list_boundaries(
+    p: AsyncConnectionPool = Depends(get_pool),
+) -> list[BoundaryOut]:
+    async with p.connection() as conn:
+        rows = await archive.list_boundaries(conn)
+        await conn.commit()
+    return [BoundaryOut(**r) for r in rows]
+
+
+@app.get(
+    "/archive/boundaries/{station_id}",
+    response_model=BoundaryOut,
+    tags=["archive"],
+    summary="单站归档界线（含热表/归档表行数，便于核对不漏数）",
+)
+async def get_boundary(
+    station_id: int, p: AsyncConnectionPool = Depends(get_pool)
+) -> BoundaryOut:
+    async with p.connection() as conn:
+        row = await archive.boundary_detail(conn, station_id)
+        await conn.commit()
+    if row is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"no archive boundary for station {station_id}",
+        )
+    return BoundaryOut(**row)
 
 
 # --------------------------------------------------------------------------- #

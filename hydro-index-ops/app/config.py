@@ -31,6 +31,8 @@ class Settings:
     cleanup_retry_interval: float = _get_float("HYDRO_CLEANUP_RETRY_INTERVAL", 3.0)
     # 演示开关：前 N 次 DROP INDEX 清理故意失败（生产必须为 0）
     cleanup_fail_first: int = _get_int("HYDRO_CLEANUP_FAIL_FIRST", 0)
+    # 归档/写入路由等待“按站咨询锁”的最长时间（毫秒），超时返回 409 让客户端重试
+    archive_lock_timeout_ms: int = _get_int("HYDRO_ARCHIVE_LOCK_TIMEOUT_MS", 10000)
     log_level: str = os.getenv("HYDRO_LOG_LEVEL", "INFO")
 
     # 本系统管理的索引与构建会话标识——清理/恢复只认这些，绝不触碰人工索引

@@ -44,3 +44,25 @@ INSERT INTO readings (station_id, observed_at, water_level)
 VALUES (1, now(), 21.500) RETURNING id;
 
 SELECT * FROM readings WHERE station_id = 1 ORDER BY observed_at DESC LIMIT 5;
+
+-- 6. 归档界线与两表行数核对（hot + archived 应等于归档前总行数，不漏数）
+SELECT b.station_id, b.cutoff, b.updated_at,
+       (SELECT count(*) FROM readings         r WHERE r.station_id = b.station_id) AS hot_rows,
+       (SELECT count(*) FROM readings_archive a WHERE a.station_id = b.station_id) AS archived_rows
+FROM archive_boundaries b ORDER BY b.station_id;
+
+-- 7. 界线一致性校验：热表中不应存在早于界线的记录（应为 0 行）
+SELECT b.station_id, count(*) AS leaked_hot_rows
+FROM archive_boundaries b
+JOIN readings r ON r.station_id = b.station_id AND r.observed_at < b.cutoff
+GROUP BY b.station_id;
+
+-- 8. 两表 id 重复校验（共用序列 + 原子搬迁，应为 0 行）
+SELECT count(*) AS duplicate_ids
+FROM readings r
+JOIN readings_archive a ON a.id = r.id;
+
+-- 9. 归档相关的按站咨询锁持有/等待情况
+SELECT pid, locktype, mode, granted, objid
+FROM pg_locks
+WHERE locktype = 'advisory' AND pid <> pg_backend_pid();

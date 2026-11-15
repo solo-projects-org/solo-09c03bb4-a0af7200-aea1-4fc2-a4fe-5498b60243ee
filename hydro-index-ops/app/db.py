@@ -44,6 +44,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_batch_one_active
     WHERE state IN ('PENDING', 'BUILDING', 'CANCELLING', 'CLEANING');
 """
 
+# 归档表与界线表：
+#   readings_archive  结构与热表一致；id 与热表共用 readings_id_seq 序列，
+#                     搬迁保留原 id、迟到直写归档取新 id，两表 id 全局唯一，
+#                     跨表 UNION ALL 查询绝不重复。
+#   archive_boundaries 每站一条归档界线：observed_at < cutoff 的观测属于归档；
+#                     界线只许前进（应用层在按站排他咨询锁内校验并推进）。
+# 搬迁（DELETE→INSERT）与界线推进在同一事务提交：归档失败或服务重启时
+# 两者一起回滚，数据与界线永远保持同一已提交状态。
+DDL_ARCHIVE_TABLES = """
+CREATE TABLE IF NOT EXISTS readings_archive (
+    id           BIGINT NOT NULL DEFAULT nextval('readings_id_seq'),
+    station_id   BIGINT NOT NULL,
+    observed_at  TIMESTAMPTZ NOT NULL,
+    water_level  NUMERIC(8, 3) NOT NULL,
+    discharge    NUMERIC(12, 3),
+    quality      TEXT NOT NULL DEFAULT 'GOOD',
+    ingested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    archived_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_readings_archive PRIMARY KEY (id),
+    CONSTRAINT fk_readings_archive_station FOREIGN KEY (station_id)
+        REFERENCES stations (station_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_readings_archive_station_observed
+    ON readings_archive (station_id, observed_at);
+
+CREATE TABLE IF NOT EXISTS archive_boundaries (
+    station_id  BIGINT PRIMARY KEY
+        REFERENCES stations (station_id),
+    cutoff      TIMESTAMPTZ NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
 
 async def init_pool() -> AsyncConnectionPool:
     global pool
@@ -58,8 +92,9 @@ async def init_pool() -> AsyncConnectionPool:
     await pool.open()
     async with pool.connection() as conn:
         await conn.execute(DDL_BATCH_TABLE)
+        await conn.execute(DDL_ARCHIVE_TABLES)
         await conn.commit()
-    log.info("connection pool ready, batch table ensured")
+    log.info("connection pool ready, batch/archive tables ensured")
     return pool
 
 
